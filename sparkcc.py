@@ -3,6 +3,9 @@ import json
 import logging
 import os
 import re
+import time
+import math
+import logging
 
 from io import BytesIO
 from tempfile import SpooledTemporaryFile, TemporaryFile
@@ -71,6 +74,7 @@ class CCSparkJob(object):
 
         arg_parser.add_argument("input", help=self.input_descr)
         arg_parser.add_argument("output", help=self.output_descr)
+
         arg_parser.add_argument("--input_base_url",
                                 help="Base URL (prefix) used if paths to WARC/WAT/WET "
                                 "files are relative paths. Used to select the "
@@ -297,7 +301,16 @@ class CCSparkJob(object):
                 #self.get_logger().debug('Fetching {} ({})'.format(uri, headers))
             else:
                 self.get_logger().info('Fetching {}'.format(uri))
+
+            time.sleep(1)
             response = requests.get(uri, headers=headers)
+            # retries = 0
+            # # sleep_timer = 1
+            # while (not response.ok and retries < 20):
+            #     time.sleep(3)
+            #     response = requests.get(uri, headers=headers)
+            #     retries += 1
+            #     sleep_timer *= 2
 
             if response.ok:
                 # includes "HTTP 206 Partial Content" for range requests
@@ -307,9 +320,15 @@ class CCSparkJob(object):
                 warctemp.write(response.content)
                 warctemp.seek(0)
                 stream = warctemp
+                # self.get_logger().info(
+                #     'success {}: {}'.format(uri, response.status_code))
+                # print(self.warc_input_processed, end='\r')
+                # self.log_processed_uri(uri)
             else:
                 self.get_logger().error(
                     'Failed to download {}: {}'.format(uri, response.status_code))
+                self.log_processed_uri(uri, "FAIL")
+
 
         elif scheme == 'hdfs':
             try:
@@ -338,7 +357,7 @@ class CCSparkJob(object):
 
         return stream
 
-    def process_warcs(self, _id, iterator):
+    def process_warcs(self, iterator):
         """Process WARC/WAT/WET files, calling iterate_records(...) for each file"""
         for uri in iterator:
             self.warc_input_processed.add(1)
@@ -347,10 +366,39 @@ class CCSparkJob(object):
             if not stream:
                 continue
 
-            for res in self.process_warc(uri, stream):
-                yield res
+            # for res in self.process_warc(uri, stream):
+            #     yield res
+
+            results = filter(lambda res: res is not None, self.process_warc(uri, stream))
+            yield from results
 
             stream.close()
+
+            # self.log_processed_uri(uri)
+
+    def log_processed_uri(self, uri, result = 'SUCCESS'):
+        """Log the processed URI to a file."""
+        log_file_path = "output/processed_warcs.txt"
+        logging.basicConfig(filename=log_file_path, level=logging.DEBUG, filemode='a')
+        logging.info(f"{result}: {uri}")
+
+
+    # def process_warcs(self, _id, iterator):
+    #     """Process WARC/WAT/WET files, calling iterate_records(...) for each file"""
+    #     def yield_streams(iterator):
+    #         for uri in iterator:
+    #             self.warc_input_processed.add(1)
+
+    #             yield (uri,self.fetch_warc(uri, self.args.input_base_url))
+    #     streams = yield_streams(iterator)
+
+    #     for (uri,stream) in streams:
+    #         if not stream:
+    #             continue
+    #         for res in self.process_warc(uri, stream):
+    #             yield res
+
+    #         stream.close()
 
     def process_warc(self, uri, stream):
         """Parse a WARC (or WAT/WET file) using warcio,
@@ -533,6 +581,7 @@ class CCIndexWarcSparkJob(CCIndexSparkJob):
                             "to include the columns `url', `warc_filename', "
                             "`warc_record_offset' and `warc_record_length'. The "
                             "input table is typically a result of a CTAS query "
+
                             "(create table as).  Allowed formats are: orc, "
                             "json lines, csv, parquet and other formats "
                             "supported by Spark.")
@@ -576,7 +625,7 @@ class CCIndexWarcSparkJob(CCIndexSparkJob):
             yield res
 
     def fetch_process_warc_records(self, rows):
-        """Fetch and process WARC records specified by columns warc_filename, 
+        """Fetch and process WARC records specified by columns warc_filename,
         warc_record_offset and warc_record_length in rows"""
 
         no_parse = (not self.warc_parse_http_header)
@@ -589,11 +638,12 @@ class CCIndexWarcSparkJob(CCIndexSparkJob):
             self.get_logger().debug("Fetching WARC record for {}".format(url))
             record_stream = self.fetch_warc(warc_path, self.args.input_base_url, offset, length)
             try:
-                for record in ArchiveIterator(record_stream,
-                                              no_record_parse=no_parse):
-                    for res in self.process_record_with_row(record, row):
-                        yield res
-                    self.records_processed.add(1)
+                if (record_stream):
+                    for record in ArchiveIterator(record_stream,
+                                                no_record_parse=no_parse):
+                        for res in self.process_record_with_row(record, row):
+                            yield res
+                        self.records_processed.add(1)
             except ArchiveLoadFailed as exception:
                 self.warc_input_failed.add(1)
                 self.get_logger().error(
