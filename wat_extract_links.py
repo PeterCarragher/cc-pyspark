@@ -344,8 +344,9 @@ class ExtractHostLinksJob(ExtractLinksJob):
     global_link_pattern = re.compile(r'^(?:[a-z][a-z0-9]{1,5}:)?//',
                                      re.IGNORECASE|re.ASCII)
 
-    # match IP addresses
-    ip_pattern = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\Z')
+    # simple pattern to match common IPv4 and IPv6 addresses
+    # (short link to avoid that IP addresses are validated as host names)
+    host_ip_pattern = re.compile(r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[0-9a-f]{0,4}:[0-9a-f:]+)\Z')
 
     # valid host names, relaxed allowing underscore, allowing also IDNAs
     # https://en.wikipedia.org/wiki/Hostname#Restrictions_on_valid_hostnames
@@ -372,7 +373,7 @@ class ExtractHostLinksJob(ExtractLinksJob):
         host = host.strip().lower()
         if len(host) < 1 or len(host) > 253:
             return None
-        if ExtractHostLinksJob.ip_pattern.match(host):
+        if ExtractHostLinksJob.host_ip_pattern.match(host):
             return None
         parts = host.split('.')
         if parts[-1] == '':
