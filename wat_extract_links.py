@@ -345,8 +345,7 @@ class ExtractHostLinksJob(ExtractLinksJob):
                                      re.IGNORECASE|re.ASCII)
 
     # match IP addresses
-    # - including IPs with leading `www.' (stripped)
-    ip_pattern = re.compile(r'^(?:www\.)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\Z')
+    ip_pattern = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\Z')
 
     # valid host names, relaxed allowing underscore, allowing also IDNAs
     # https://en.wikipedia.org/wiki/Hostname#Restrictions_on_valid_hostnames
@@ -382,10 +381,6 @@ class ExtractHostLinksJob(ExtractLinksJob):
         if len(parts) <= 1:
             # do not accept single-word hosts, must be at least `domain.tld'
             return None
-        if len(parts) > 2 and parts[0] == 'www':
-            # strip leading 'www' to reduce number of "duplicate" hosts,
-            # but leave at least 2 trailing parts (www.com is a valid domain)
-            parts = parts[1:]
         for (i, part) in enumerate(parts):
             if len(part) > 63:
                 return None
