@@ -9,9 +9,13 @@ This is a simplified version of count_domain_links.py for the specific use
 case of computing a link-weight matrix within a closed domain set (e.g. news
 outlets linking to each other).
 
-Output schema: s STRING, t STRING, count LONG
-  s, t  -- registered domains (eTLD+1), e.g. 'bbc.co.uk'
-  count -- total <a href> links from s to t across all crawled pages of s
+Output schema: s STRING, t STRING, nav_count LONG, body_count LONG
+  s, t        -- registered domains (eTLD+1), e.g. 'bbc.co.uk'
+  nav_count   -- links from s to t found inside <header>, <footer>, <nav>,
+                 <aside>, or elements whose class/id suggests navigation
+  body_count  -- links from s to t found inside <article>, <main>, or
+                 elements whose class/id suggests article body content.
+                 Uncontextualized links default to body.
 
 Usage:
   # Run on EMR Serverless (expanded-domains mode):
@@ -63,7 +67,8 @@ class CountNewsLinksJob(CCIndexWarcSparkJob):
     output_schema = StructType([
         StructField('s', StringType(), True),
         StructField('t', StringType(), True),
-        StructField('count', LongType(), True),
+        StructField('nav_count', LongType(), True),
+        StructField('body_count', LongType(), True),
     ])
 
     warc_parse_http_header = True
@@ -79,30 +84,107 @@ class CountNewsLinksJob(CCIndexWarcSparkJob):
 
     # ── HTML parsing ───────────────────────────────────────────────────────────
 
+    # Void elements never have a closing tag; don't push them onto the stack.
+    _VOID_ELEMENTS = frozenset([
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+        'link', 'meta', 'param', 'source', 'track', 'wbr',
+    ])
+
+    # Tags that are unambiguously navigational/structural chrome.
+    _NAV_TAGS = frozenset(['header', 'footer', 'nav', 'aside'])
+
+    # Tags that are unambiguously article body.
+    # <p> is included: editorial citations are almost always inline prose;
+    # nav/footer links are almost never wrapped in <p> tags.
+    _BODY_TAGS = frozenset(['article', 'main', 'p'])
+
+    # class/id substrings that suggest navigational context.
+    _NAV_HINTS = frozenset([
+        'nav', 'menu', 'header', 'footer', 'sidebar', 'breadcrumb',
+        'share', 'social', 'related', 'widget', 'toolbar', 'banner',
+        'masthead', 'topbar', 'subnav', 'utility',
+    ])
+
+    # class/id substrings that suggest editorial body context.
+    _BODY_HINTS = frozenset([
+        'article', 'story', 'post', 'entry', 'content', 'body',
+        'prose', 'text', 'detail', 'richtext', 'byline', 'copy',
+    ])
+
+    @classmethod
+    def _classify_tag(cls, tag, attrs_d):
+        """Return 'nav', 'body', or None (inherit from parent) for an opening tag."""
+        if tag in cls._NAV_TAGS:
+            return 'nav'
+        if tag in cls._BODY_TAGS:
+            return 'body'
+        # Inspect class and id attributes for hint words
+        class_id = (attrs_d.get('class', '') + ' ' + attrs_d.get('id', '')).lower()
+        if any(h in class_id for h in cls._NAV_HINTS):
+            return 'nav'
+        if any(h in class_id for h in cls._BODY_HINTS):
+            return 'body'
+        return None  # no signal; inherit from ancestor
+
     class _LinkParser(HTMLParser):
-        def __init__(self):
+        """SAX-style parser that classifies each <a href> as nav or body.
+
+        Maintains a stack of (tag, context) pairs where context is 'nav',
+        'body', or None (inherit). Each <a> is classified by walking the
+        stack to find the nearest explicit ancestor context. Uncontextualized
+        links default to 'body' (most page content is body by default).
+        """
+
+        def __init__(self, classify_tag_fn, void_elements):
             super(CountNewsLinksJob._LinkParser, self).__init__()
+            self._classify_tag = classify_tag_fn
+            self._void_elements = void_elements
             self.base = None
-            self.hrefs = []
+            self.nav_hrefs = []
+            self.body_hrefs = []
+            self._stack = []  # list of (tag, context)  context='nav'|'body'|None
+
+        def _current_context(self):
+            for _, ctx in reversed(self._stack):
+                if ctx is not None:
+                    return ctx
+            return 'nav'  # default: uncontextualized links are nav
 
         def handle_starttag(self, tag, attrs):
-            attrs = dict(attrs)
+            attrs_d = dict(attrs)
             if tag == 'base' and self.base is None:
-                self.base = attrs.get('href')
-            elif tag == 'a':
-                href = attrs.get('href')
+                self.base = attrs_d.get('href')
+
+            if tag == 'a':
+                href = attrs_d.get('href')
                 if href:
-                    self.hrefs.append(href)
+                    if self._current_context() == 'nav':
+                        self.nav_hrefs.append(href)
+                    else:
+                        self.body_hrefs.append(href)
+
+            if tag not in self._void_elements:
+                ctx = self._classify_tag(tag, attrs_d)
+                self._stack.append((tag, ctx))
+
+        def handle_endtag(self, tag):
+            # Pop back to the most recent matching open tag, tolerating
+            # malformed HTML where tags may be unmatched or misnested.
+            for i in range(len(self._stack) - 1, -1, -1):
+                if self._stack[i][0] == tag:
+                    self._stack = self._stack[:i]
+                    break
 
         def error(self, _message):
             pass
 
     def _get_link_counts(self, url, html_bytes, src_domain):
-        """Parse HTML; return Counter of {target_domain: count} for in-list targets."""
+        """Parse HTML; return (nav_counts, body_counts) Counters for in-list targets."""
         target_set = self.target_domains_bc.value
-        counts = Counter()
+        nav_counts = Counter()
+        body_counts = Counter()
         try:
-            parser = self._LinkParser()
+            parser = self._LinkParser(self._classify_tag, self._VOID_ELEMENTS)
             parser.feed(html_bytes.decode('utf-8', errors='replace'))
             base_url = url
             if parser.base:
@@ -110,17 +192,21 @@ class CountNewsLinksJob(CCIndexWarcSparkJob):
                     base_url = urljoin(url, parser.base)
                 except Exception:
                     pass
-            for href in parser.hrefs:
-                try:
-                    abs_url = urljoin(base_url, href)
-                    tdomain = _registered_domain(abs_url)
-                except Exception:
-                    continue
-                if tdomain and tdomain != src_domain and tdomain in target_set:
-                    counts[tdomain] += 1
+            for href_list, counts in (
+                (parser.nav_hrefs, nav_counts),
+                (parser.body_hrefs, body_counts),
+            ):
+                for href in href_list:
+                    try:
+                        abs_url = urljoin(base_url, href)
+                        tdomain = _registered_domain(abs_url)
+                    except Exception:
+                        continue
+                    if tdomain and tdomain != src_domain and tdomain in target_set:
+                        counts[tdomain] += 1
         except Exception:
             pass
-        return counts
+        return nav_counts, body_counts
 
     # ── WARC record processing ─────────────────────────────────────────────────
 
@@ -146,10 +232,13 @@ class CountNewsLinksJob(CCIndexWarcSparkJob):
             self.records_failed.add(1)
             return
         self.records_html.add(1)
-        counts = self._get_link_counts(url, html_bytes, src_domain)
-        for tdomain, count in counts.items():
-            self.link_count.add(count)
-            yield src_domain, tdomain, count
+        nav_counts, body_counts = self._get_link_counts(url, html_bytes, src_domain)
+        all_targets = set(nav_counts) | set(body_counts)
+        for tdomain in all_targets:
+            n = nav_counts.get(tdomain, 0)
+            b = body_counts.get(tdomain, 0)
+            self.link_count.add(n + b)
+            yield src_domain, tdomain, n, b
 
     # ── Accumulators ───────────────────────────────────────────────────────────
 
@@ -261,7 +350,10 @@ class CountNewsLinksJob(CCIndexWarcSparkJob):
             .dropna(subset=['s', 't'])
             .filter(F.col('s') != F.col('t'))
             .groupBy('s', 't')
-            .agg(F.sum('count').alias('count'))
+            .agg(
+                F.sum('nav_count').alias('nav_count'),
+                F.sum('body_count').alias('body_count'),
+            )
             .coalesce(self.args.num_output_partitions)
             .write
             .format(self.args.output_format)
