@@ -20,6 +20,14 @@ Output schema: s STRING, t STRING, nav_count LONG, body_count LONG,
   other_count    -- everything else: sidebars, bylines, share buttons,
                     uncontextualized links
 
+Usage notes: for sites which rely on <div> elements in combination with CSS to structure their pages, all links might end up in the "other" category.
+If the number of target domains is in the millions, the Spark job is likely to fail due to the use of broadcast variables. 
+In that case, consider disabling the filtering step by removing the broadcast variable target_domains_bc and returning all outlinks from the target domain list.
+In this case the increased output size will require more output partitions when running on AWS EMR (via run_ccpyspark_job_aws_emr.sh).
+
+# TODO: add option to disable the in-memory broadcast variable filtering step and instead filter the output DataFrame after the link extraction step.
+# This would allow for larger domain lists at the cost of increased output size and processing time.
+
 Usage:
   bash run_ccpyspark_job_aws_emr.sh \\
     s3://bucket/code/count_domain_links.py \\
@@ -226,7 +234,7 @@ class CountDomainLinksJob(CCIndexWarcSparkJob):
                         tdomain = _registered_domain(abs_url)
                     except Exception:
                         continue
-                    if tdomain and tdomain != src_domain and tdomain in target_set:
+                    if tdomain and tdomain in target_set:
                         counts[tdomain] += 1
         except Exception:
             pass
@@ -239,10 +247,16 @@ class CountDomainLinksJob(CCIndexWarcSparkJob):
             return
         if record.http_headers.get_statuscode() != '200':
             return
-        ct = record.http_headers.get_header('Content-Type', '')
-        if 'text/html' not in ct.lower():
+        
+        # First try WARC-Identified-Payload-Type, if that fails, fall back to Content-Type header field. 
+        # Note, both fields may be missing or incorrect, in which case links from that webpage will not be counted.
+        ct = record.http_headers.get_header('WARC-Identified-Payload-Type', '')
+        if ct == '':
+            ct = record.rec_headers.get_header('Content-Type', '')
+        if 'text/html' not in ct.lower() and 'application/xhtml+xml' not in ct.lower():
             self.records_non_html.add(1)
             return
+    
         url = record.rec_headers.get_header('WARC-Target-URI')
         if not url:
             return
@@ -322,6 +336,9 @@ class CountDomainLinksJob(CCIndexWarcSparkJob):
             domain = _registered_domain(val)
             if domain:
                 domains.add(domain)
+        
+        # Note: This broadcast variable will limit the maximum size of the domain list.
+        # If the number of domains is in the millions the Spark job is likely to fail.
         self.target_domains_bc = session.sparkContext.broadcast(domains)
         self.get_logger().info(
             'Target domains loaded: {}'.format(len(domains)))
@@ -338,11 +355,10 @@ class CountDomainLinksJob(CCIndexWarcSparkJob):
             session.read.parquet(self.args.input)
             .filter(F.col('crawl') == self.args.crawl)
             .filter(F.col('subset') == 'warc')
-            .filter(F.col('fetch_status') == 200)
-            .filter(F.col('content_mime_detected') == 'text/html')
+            .filter((F.col('content_mime_detected') == 'text/html') | 
+                (F.col('content_mime_detected') == 'application/xhtml+xml'))
             .join(F.broadcast(domain_df),
-                  F.col('url_host_registered_domain') == domain_df['host'],
-                  how='inner')
+                F.col('url_host_registered_domain') == domain_df['host'], how='inner')
             .select('url', 'warc_filename', 'warc_record_offset', 'warc_record_length')
         )
         if self.args.num_input_partitions > 0:
@@ -367,7 +383,6 @@ class CountDomainLinksJob(CCIndexWarcSparkJob):
         (
             session.createDataFrame(output, schema=self.output_schema)
             .dropna(subset=['s', 't'])
-            .filter(F.col('s') != F.col('t'))
             .groupBy('s', 't')
             .agg(
                 F.sum('nav_count').alias('nav_count'),
