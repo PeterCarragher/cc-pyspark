@@ -247,16 +247,16 @@ class CountDomainLinksJob(CCIndexWarcSparkJob):
             return
         if record.http_headers.get_statuscode() != '200':
             return
-        
+
         # First try WARC-Identified-Payload-Type, if that fails, fall back to Content-Type header field. 
         # Note, both fields may be missing or incorrect, in which case links from that webpage will not be counted.
-        ct = record.http_headers.get_header('WARC-Identified-Payload-Type', '')
-        if ct == '':
-            ct = record.rec_headers.get_header('Content-Type', '')
-        if 'text/html' not in ct.lower() and 'application/xhtml+xml' not in ct.lower():
+        ct = record.rec_headers.get_header('WARC-Identified-Payload-Type')
+        if ct is None:
+            ct = record.http_headers.get_header('Content-Type', '').lower()
+        if 'text/html' not in ct and 'application/xhtml+xml' not in ct:
             self.records_non_html.add(1)
             return
-    
+
         url = record.rec_headers.get_header('WARC-Target-URI')
         if not url:
             return
